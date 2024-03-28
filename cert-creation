@@ -1,0 +1,157 @@
+# NGINX reverse proxy with SSL cert authentication
+
+This is a short guide for those who want to set up a NGINX reverse proxy with SSL cert authentication. The basic idea is to create a private CA and emit certificates signed by it. Only browsers and/or devices with the certs signed by this CA will be granted access to resources behind the proxy.
+
+There are a few examples of similar configurations on the web, but most use openssl directly. This gist uses Easy-RSA to simplify the task of creating and maintaining a private CA and certs to be distributed to clients.
+
+## Install and configure Easy-RSA
+
+Clone Easy-RSA 3:
+
+```bash
+$ cd
+$ git clone https://github.com/OpenVPN/easy-rsa.git
+```
+When git finishes, initialize your CA:
+
+```base
+$ cd ~/easy-rsa/easyrsa3
+$ ./easyrsa init-pki
+$ ./easyrsa build-ca
+```
+
+Don't lose your CA password! Also, it's a good idea to maintain your CA keys in a machine *outside* your network. DO NOT store your CA keys on your server!
+
+Easy-RSA will store your keys and certs under the `~/pki` directory. Typical structure:
+
+* ~/pki/ca.crt <-- CA cert
+* ~/pki/issued <-- Issued client & server public certs
+* ~/pki/private <-- Issued keys & PKCS12 certs containing certs and keys.
+
+## NGINX server setup
+
+In this example, we'll create a reverse proxy that accepts https requests on port 9999 and forwards them to port 8888 on the same machine where NGINX runs. Let's suppose your proxy runs on a server reachable from the outside on the "proxy.foobar.com" name (change all instances of proxy.foobar.com below for your real FQDN).
+
+First, on the machine where Easy-RSA was installed, create a server certificate:
+
+```bash
+$ cd ~/easy-rsa/easyrsa3
+$ export HOST="proxy.foobar.com"
+$ ./easyrsa build-server-full --alternate-san-name="DNS:${HOST}" ${HOST} nopass
+```
+
+This will create a server certificate under `~/pki/issued` and a server key under `~/pki/private`.
+
+Copy the following files from your Easy-RSA machine into the "/etc/nginx/proxy" directory on your NGINX server. You may have to create the "/etc/nginx/certs" directory if it does not exist.
+
+* `~/pki/issued/proxy.foobar.com.crt`
+* `~/pki/private/proxy.foobar.com.key`
+* `~/pki/ca.crt`
+
+Edit your NGINX config files. I prefer to *not* serve unqualified domains of any sort (all my valid configurations are vhosts.) Example of `/etc/nginx/sites-enabled` file below:
+
+```
+server {
+  listen 80 default_server;
+  listen 443 ssl default_server;
+  listen [::]:80 default_server ipv6only=on;
+
+  location = / {
+    deny all;
+  }
+
+  # Anything that does not match a vhost.
+  server_name _;
+
+  # SSL config
+  ssl_certificate <path_to_your_letsencrypt_pem>;
+  ssl_certificate_key <path_to_your_letsencrypt_key>;
+}
+```
+
+In my case, my default serving configuration (for other resources under this site) uses letsencrypt certs. Adjust the configuration above as required for your case.
+
+We now need a proxy config in a file called `/etc/nginx/sites-enabled/proxy.foobar.com`:
+
+```
+server {
+  listen 9999 ssl;
+  server_name yourserver.yourdomain;
+
+  # SSL config
+  # This uses self-signed certs to control access
+  ssl_certificate      /etc/nginx/certs/proxy.foobar.com.crt;
+  ssl_certificate_key  /etc/nginx/certs/proxy.foobar.com.key;
+  ssl_client_certificate /etc/nginx/certs/ca.crt;
+  ssl_verify_client on;
+
+  # Reverse proxy to port 8888
+  location / {
+    proxy_pass http://localhost:8888;
+  }
+}
+```
+
+Restart nginx to pick up the changes and look for errors in the log files.
+
+## Client configuration
+
+### Generating client keys
+
+We need to create a client cert. **DO NOT** share the same cert across multiple users/clients! At most, one cert per person (no sharing!). Let's say person is called "meh":
+
+```bash
+$ cd easy-rsa/easyrsa3
+$ ./easyrsa --days=365 build-client-full meh-client nopass
+```
+This cert is valid for one year. Next, generate a PKCS#12 cert with this cert+key (most browsers can only load PKCS#12 certs):
+
+```bash
+$ ./easyrsa export-p12 meh-client
+```
+
+This will ask for a cert password. Type a non-obvious password and keep it safe. The browser will ask for this password at import time.
+
+The ".p12" file will be saved under "~/pki/private".
+
+### Chrome installation
+
+* Copy the p12 file over to the client machine using a safe method (SSH).
+* Navigate to the [Chrome Certificate Management](chrome://settings/certificates) page.
+* Click "Import" and select the p12 file. Type the pkcs#12 password as requested.
+* Still on the Cert management page, click on "Authorities".
+* Use Ctrl-F to locate "org-Easy-RSA ca".
+* Click on the line with the CA, select the "three dots" menu, then "Edit".
+* Select "Trust this certificate for identifying websites"
+
+This should be all. To test, visit your site, port 9999.
+
+
+### Android
+
+* Copy the p12 file to your Android phone using a safe method (one option is to upload to your private Google Drive account - Android can install certs directly from Google Drive.)
+* Open the Android settings page.
+* Search for "Certificates" (the location of this changes a lot, depending on your Android version -- use the search function inside settings to locate).
+* Locate the "Install Certificates" page.
+* Select a new certificate (some versions of Android require the cert to be in local storage, others allow direct install from Google Drive.)
+* Give the certificate a name (say, "meh-client")
+* If asked, give choose "VPN and Apps" for the "Credential Use"
+* Install.
+
+In my case, Android *did not* install the CA cert in a single operation. Repeat the steps above, but using the "ca.crt" file you created during the first step in your Easy-RSA installation.
+
+### iOS
+
+* Copy the p12 file to your iOS device using a safe method (one option is to use AirDrop)
+* After you've received a profile, you’ll see the message "Profile Downloaded"
+
+To install the profile, follow these steps:
+* Open the Settings app -> General -> VPN & Device management
+* Tap "Profile Downloaded"
+* Tap "Identity Certificate"
+* The identity certifitate will be displayed
+* Tap "Install"
+* Enter iOS unlock code
+* Tap "Install"
+* Enter cert password
+  
